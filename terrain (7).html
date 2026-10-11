@@ -1,0 +1,1019 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Terrain Generator Prototype</title>
+    <style>
+        body { margin: 0; overflow: hidden; }
+        canvas { display: block; }
+    </style>
+</head>
+<body>
+
+    <script type="importmap">
+        {
+          "imports": {
+            "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+            "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+          }
+        }
+    </script>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+        import { GLTFExporter } from 'three/addons/exporters/GLTFExporter.js';
+        import GUI from 'https://cdn.jsdelivr.net/npm/lil-gui@0.18/+esm';
+
+        // --- SIMPLEX NOISE (2D, seedable, self-contained) ---
+        function createNoise2D(seed = 1) {
+            // Small seeded PRNG (mulberry32)
+            let a = seed >>> 0;
+            const rand = () => {
+                a = (a + 0x6D2B79F5) >>> 0;
+                let t = a;
+                t = Math.imul(t ^ (t >>> 15), t | 1);
+                t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+                return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+            };
+
+            const p = new Uint8Array(256);
+            for (let i = 0; i < 256; i++) p[i] = i;
+            for (let i = 255; i > 0; i--) {
+                const j = Math.floor(rand() * (i + 1));
+                [p[i], p[j]] = [p[j], p[i]];
+            }
+            const perm = new Uint8Array(512);
+            for (let i = 0; i < 512; i++) perm[i] = p[i & 255];
+
+            const grad = [[1,1],[-1,1],[1,-1],[-1,-1],[1,0],[-1,0],[0,1],[0,-1]];
+            const F2 = 0.5 * (Math.sqrt(3) - 1);
+            const G2 = (3 - Math.sqrt(3)) / 6;
+
+            return function noise2D(xin, yin) {
+                const s = (xin + yin) * F2;
+                const i = Math.floor(xin + s);
+                const j = Math.floor(yin + s);
+                const t = (i + j) * G2;
+                const x0 = xin - (i - t);
+                const y0 = yin - (j - t);
+                const i1 = x0 > y0 ? 1 : 0;
+                const j1 = x0 > y0 ? 0 : 1;
+                const x1 = x0 - i1 + G2, y1 = y0 - j1 + G2;
+                const x2 = x0 - 1 + 2 * G2, y2 = y0 - 1 + 2 * G2;
+                const ii = i & 255, jj = j & 255;
+
+                let n = 0;
+                let t0 = 0.5 - x0 * x0 - y0 * y0;
+                if (t0 > 0) {
+                    const g = grad[perm[ii + perm[jj]] & 7];
+                    t0 *= t0; n += t0 * t0 * (g[0] * x0 + g[1] * y0);
+                }
+                let t1 = 0.5 - x1 * x1 - y1 * y1;
+                if (t1 > 0) {
+                    const g = grad[perm[ii + i1 + perm[jj + j1]] & 7];
+                    t1 *= t1; n += t1 * t1 * (g[0] * x1 + g[1] * y1);
+                }
+                let t2 = 0.5 - x2 * x2 - y2 * y2;
+                if (t2 > 0) {
+                    const g = grad[perm[ii + 1 + perm[jj + 1]] & 7];
+                    t2 *= t2; n += t2 * t2 * (g[0] * x2 + g[1] * y2);
+                }
+                return 70 * n; // roughly [-1, 1]
+            };
+        }
+
+        // --- SCENE SETUP ---
+        const scene = new THREE.Scene();
+        scene.background = new THREE.Color(0x9ec5e8);
+        scene.fog = new THREE.Fog(0x9ec5e8, 150, 400);
+
+        const camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 1000);
+        const renderer = new THREE.WebGLRenderer({ antialias: true });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+        document.body.appendChild(renderer.domElement);
+
+        const controls = new OrbitControls(camera, renderer.domElement);
+        camera.position.set(0, 60, 100);
+        controls.update();
+
+        scene.add(new THREE.AmbientLight(0xffffff, 0.5));
+        const dirLight = new THREE.DirectionalLight(0xffffff, 1.0);
+        dirLight.position.set(60, 100, 40);
+        scene.add(dirLight);
+
+        // --- TERRAIN MESH ---
+        // Map dimensions are adjustable. Noise features are scaled against a fixed reference
+        // length, so enlarging the map reveals more terrain instead of stretching it.
+        const NOISE_REF = 100;
+        let SIZE_X = 100, SIZE_Z = 100, SEG_X = 200, SEG_Z = 200;
+
+        function createTerrainGeometry() {
+            SEG_X = Math.min(400, Math.max(16, Math.round(SIZE_X * 2)));
+            SEG_Z = Math.min(400, Math.max(16, Math.round(SIZE_Z * 2)));
+            const g = new THREE.PlaneGeometry(SIZE_X, SIZE_Z, SEG_X, SEG_Z);
+            g.rotateX(-Math.PI / 2); // Lay the plane flat
+            const n = g.attributes.position.count;
+            g.setAttribute('color', new THREE.BufferAttribute(new Float32Array(n * 3), 3));
+            g.setAttribute('aSplat', new THREE.BufferAttribute(new Float32Array(n * 4), 4));
+            return g;
+        }
+        let geometry = createTerrainGeometry();
+
+        const material = new THREE.MeshStandardMaterial({
+            vertexColors: true,
+            roughness: 0.95,
+            metalness: 0,
+            wireframe: false
+        });
+        const terrain = new THREE.Mesh(geometry, material);
+        scene.add(terrain);
+
+        // Palette for height + slope based coloring
+        const COL = {
+            lowland:  new THREE.Color(0x5a8f3c), // flat low grass
+            highland: new THREE.Color(0x35602d), // darker forest/alpine grass
+            rockLow:  new THREE.Color(0x6e5b46), // brown rock
+            rockHigh: new THREE.Color(0x8c8984), // grey rock
+            snow:     new THREE.Color(0xffffff)
+        };
+        const tmpColor = new THREE.Color();
+        const rockColor = new THREE.Color();
+        const smoothstep = (e0, e1, x) => {
+            const t = Math.min(1, Math.max(0, (x - e0) / (e1 - e0)));
+            return t * t * (3 - 2 * t);
+        };
+
+        // --- PARAMETERS ---
+        const params = {
+            height: 25,
+            frequency: 2.5,
+            octaves: 5,
+            persistence: 0.42,
+            ridgeSharpness: 0.3,
+            peakRoundness: 0.6,
+            widthVariation: 0.8,
+            warp: 0.3,
+            snowLine: 0.75,
+            rockSlope: 0.3,
+            rockBlend: 0.12,
+            seed: 1,
+            wireframe: false,
+            mapSizeX: 100,
+            mapSizeZ: 100,
+            heightMapSize: 1024,
+            downloadHeightMap: () => downloadHeightMap(),
+            useTextures: true,
+            tileSize: 14,
+            exportGLB: () => exportTerrain()
+        };
+
+        // --- TEXTURES ---
+        // Per-vertex weights (grass, rock, snow, shade) drive a shader that blends three
+        // tiled textures (triplanar, so steep faces don't stretch).
+        const texUniforms = {
+            uUseTex: { value: 1 },
+            uTile:   { value: params.tileSize },
+            uGrass:  { value: null },
+            uRock:   { value: null },
+            uSnow:   { value: null }
+        };
+
+        function patchMaterial(mat, bake) {
+            mat.customProgramCacheKey = () => bake ? 'terrain-bake' : 'terrain-lit';
+            mat.onBeforeCompile = (shader) => {
+                Object.assign(shader.uniforms, texUniforms);
+                shader.vertexShader = shader.vertexShader
+                    .replace('#include <common>', `#include <common>
+                        attribute vec4 aSplat;
+                        varying vec4 vSplat;
+                        varying vec3 vTerrP;
+                        varying vec3 vTerrN;`)
+                    .replace('#include <begin_vertex>', `#include <begin_vertex>
+                        vSplat = aSplat;
+                        vTerrP = position;
+                        vTerrN = normal;`);
+                shader.fragmentShader = shader.fragmentShader
+                    .replace('#include <common>', `#include <common>
+                        uniform float uUseTex;
+                        uniform float uTile;
+                        uniform sampler2D uGrass;
+                        uniform sampler2D uRock;
+                        uniform sampler2D uSnow;
+                        varying vec4 vSplat;
+                        varying vec3 vTerrP;
+                        varying vec3 vTerrN;
+                        vec3 triplanar(sampler2D t, vec3 p, vec3 n) {
+                            vec3 w = pow(abs(n), vec3(4.0));
+                            w /= (w.x + w.y + w.z);
+                            return texture2D(t, p.zy).rgb * w.x
+                                 + texture2D(t, p.xz).rgb * w.y
+                                 + texture2D(t, p.xy).rgb * w.z;
+                        }`)
+                    .replace('#include <color_fragment>', `
+                        if (uUseTex > 0.5) {
+                            vec3 tp = vTerrP / uTile;
+                            vec3 tn = normalize(vTerrN);
+                            vec3 tex = triplanar(uGrass, tp, tn) * vSplat.x
+                                     + triplanar(uRock,  tp, tn) * vSplat.y
+                                     + triplanar(uSnow,  tp, tn) * vSplat.z;
+                            diffuseColor.rgb = tex * vSplat.w;
+                        } else {
+                            diffuseColor.rgb *= vColor;
+                        }`);
+                if (bake) {
+                    // Render targets output linear; encode to sRGB so the baked image is correct
+                    shader.fragmentShader = shader.fragmentShader.replace(
+                        '#include <colorspace_fragment>',
+                        'gl_FragColor.rgb = pow(max(gl_FragColor.rgb, vec3(0.0)), vec3(1.0 / 2.2));');
+                }
+            };
+            mat.needsUpdate = true;
+        }
+        patchMaterial(material, false);
+
+        // Tileable value noise for procedural default textures
+        function hash2(x, y, seed) {
+            let h = (Math.imul(x, 374761393) + Math.imul(y, 668265263) + Math.imul(seed, 1442695041)) | 0;
+            h = Math.imul(h ^ (h >>> 13), 1274126177);
+            h ^= h >>> 16;
+            return (h >>> 0) / 4294967295;
+        }
+        function tileNoise(u, v, nx, ny, seed) {
+            const x = u * nx, y = v * ny;
+            const x0 = Math.floor(x), y0 = Math.floor(y);
+            const fx = x - x0, fy = y - y0;
+            const sx = fx * fx * (3 - 2 * fx), sy = fy * fy * (3 - 2 * fy);
+            const xi = x0 % nx, yi = y0 % ny, x1 = (x0 + 1) % nx, y1 = (y0 + 1) % ny;
+            const a = hash2(xi, yi, seed), b = hash2(x1, yi, seed);
+            const c = hash2(xi, y1, seed), d = hash2(x1, y1, seed);
+            return (a + (b - a) * sx) * (1 - sy) + (c + (d - c) * sx) * sy;
+        }
+        function tileFbm(u, v, nx, ny, oct, seed) {
+            let sum = 0, amp = 1, norm = 0;
+            for (let o = 0; o < oct; o++) {
+                sum += tileNoise(u, v, nx, ny, seed + o) * amp;
+                norm += amp; amp *= 0.5; nx *= 2; ny *= 2;
+            }
+            return sum / norm;
+        }
+        const mix3 = (c0, c1, t) => [c0[0] + (c1[0] - c0[0]) * t, c0[1] + (c1[1] - c0[1]) * t, c0[2] + (c1[2] - c0[2]) * t];
+        const clamp01 = x => Math.min(1, Math.max(0, x));
+
+        function makeProceduralTexture(kind) {
+            const S = 512;
+            const canvas = document.createElement('canvas');
+            canvas.width = canvas.height = S;
+            const ctx = canvas.getContext('2d');
+            const img = ctx.createImageData(S, S);
+            const d = img.data;
+            for (let y = 0; y < S; y++) {
+                for (let x = 0; x < S; x++) {
+                    const u = x / S, v = y / S;
+                    const fine = hash2(x, y, 99) - 0.5;
+                    let c;
+                    if (kind === 'grass') {
+                        const broad = tileFbm(u, v, 3, 3, 4, 11);
+                        const blades = tileFbm(u, v, 48, 6, 3, 12);
+                        const t = clamp01(broad * 0.7 + blades * 0.6 - 0.15);
+                        c = mix3([38, 76, 26], [122, 168, 64], t);
+                        if (hash2(x, y, 5) > 0.985) c = mix3(c, [190, 190, 90], 0.5);
+                        c = c.map(k => k + fine * 18);
+                    } else if (kind === 'rock') {
+                        const n1 = tileFbm(u, v, 4, 4, 5, 21);
+                        const ridge = 1 - Math.abs(2 * tileFbm(u, v, 5, 5, 4, 22) - 1);
+                        const crack = Math.pow(ridge, 8);
+                        const tint = tileFbm(u, v, 3, 3, 3, 23);
+                        c = mix3([70, 64, 58], [160, 152, 142], clamp01(n1 * 1.2 - 0.1));
+                        c = mix3(c, [120, 98, 76], tint * 0.35);
+                        c = c.map(k => k * (1 - crack * 0.55) + fine * 22);
+                    } else {
+                        const n = tileFbm(u, v, 5, 5, 4, 31);
+                        c = mix3([204, 219, 236], [250, 252, 255], clamp01(n * 1.3 - 0.1));
+                        if (hash2(x, y, 7) > 0.996) c = [255, 255, 255];
+                        c = c.map(k => k + fine * 6);
+                    }
+                    const i = (y * S + x) * 4;
+                    d[i] = clamp01(c[0] / 255) * 255;
+                    d[i + 1] = clamp01(c[1] / 255) * 255;
+                    d[i + 2] = clamp01(c[2] / 255) * 255;
+                    d[i + 3] = 255;
+                }
+            }
+            ctx.putImageData(img, 0, 0);
+            return new THREE.CanvasTexture(canvas);
+        }
+
+        const layers = {
+            grass: { uniform: 'uGrass', label: 'Grass', custom: false },
+            rock:  { uniform: 'uRock',  label: 'Rock',  custom: false },
+            snow:  { uniform: 'uSnow',  label: 'Snow',  custom: false }
+        };
+        const layerControllers = {};
+
+        function setLayerTexture(key, tex, custom, fileName) {
+            const layer = layers[key];
+            const old = texUniforms[layer.uniform].value;
+            tex.wrapS = tex.wrapT = THREE.RepeatWrapping;
+            tex.colorSpace = THREE.SRGBColorSpace;
+            tex.anisotropy = renderer.capabilities.getMaxAnisotropy();
+            tex.needsUpdate = true;
+            texUniforms[layer.uniform].value = tex;
+            if (old) old.dispose();
+            layer.custom = custom;
+            if (layerControllers[key]) {
+                layerControllers[key].name(custom ? `${layer.label}: ${fileName}` : `${layer.label}: upload image...`);
+            }
+        }
+        const resetLayer = key => setLayerTexture(key, makeProceduralTexture(key), false);
+
+        function pickFile(callback) {
+            const input = document.createElement('input');
+            input.type = 'file';
+            input.accept = 'image/*';
+            input.onchange = () => { if (input.files[0]) callback(input.files[0]); };
+            input.click();
+        }
+        function uploadLayer(key) {
+            pickFile(file => {
+                const url = URL.createObjectURL(file);
+                new THREE.TextureLoader().load(url, tex => {
+                    setLayerTexture(key, tex, true, file.name);
+                    URL.revokeObjectURL(url);
+                }, undefined, () => alert('Could not load that image.'));
+            });
+        }
+        Object.keys(layers).forEach(resetLayer);
+
+        // Bake the textured terrain top-down into a single image so it can be exported to GLB
+        // (custom shaders can't be exported, but a standard material with a map can).
+        function bakeAlbedo(maxRes) {
+            const aspect = SIZE_X / SIZE_Z;
+            const resX = aspect >= 1 ? maxRes : Math.max(16, Math.round(maxRes * aspect));
+            const resZ = aspect >= 1 ? Math.max(16, Math.round(maxRes / aspect)) : maxRes;
+            const rt = new THREE.WebGLRenderTarget(resX, resZ, { depthBuffer: true });
+            const bakeMat = new THREE.MeshBasicMaterial({ vertexColors: true, toneMapped: false, fog: false });
+            patchMaterial(bakeMat, true);
+            const bakeScene = new THREE.Scene();
+            bakeScene.add(new THREE.Mesh(geometry, bakeMat));
+            const cam = new THREE.OrthographicCamera(-SIZE_X / 2, SIZE_X / 2, SIZE_Z / 2, -SIZE_Z / 2, 1, 2000);
+            cam.up.set(0, 0, -1);
+            cam.position.set(0, 1000, 0);
+            cam.lookAt(0, 0, 0);
+
+            const prev = renderer.getRenderTarget();
+            renderer.setRenderTarget(rt);
+            renderer.render(bakeScene, cam);
+            const buf = new Uint8Array(resX * resZ * 4);
+            renderer.readRenderTargetPixels(rt, 0, 0, resX, resZ, buf);
+            renderer.setRenderTarget(prev);
+
+            const canvas = document.createElement('canvas');
+            canvas.width = resX;
+            canvas.height = resZ;
+            const ctx = canvas.getContext('2d');
+            const out = ctx.createImageData(resX, resZ);
+            for (let y = 0; y < resZ; y++) {
+                const src = (resZ - 1 - y) * resX * 4;   // render target rows are bottom-up
+                out.data.set(buf.subarray(src, src + resX * 4), y * resX * 4);
+            }
+            ctx.putImageData(out, 0, 0);
+            rt.dispose();
+            bakeMat.dispose();
+            return canvas;
+        }
+
+        function exportTerrain() {
+            const g = geometry.clone();
+            g.deleteAttribute('aSplat');
+            let mat = null;
+            if (params.useTextures) {
+                try {
+                    const tex = new THREE.CanvasTexture(bakeAlbedo(2048));
+                    tex.colorSpace = THREE.SRGBColorSpace;
+                    g.deleteAttribute('color');
+                    mat = new THREE.MeshStandardMaterial({ map: tex, roughness: 0.95, metalness: 0 });
+                } catch (e) {
+                    console.error('Texture bake failed, exporting vertex colors instead.', e);
+                }
+            }
+            if (!mat) mat = new THREE.MeshStandardMaterial({ vertexColors: true, roughness: 0.95, metalness: 0 });
+            const exporter = new GLTFExporter();
+            exporter.parse(new THREE.Mesh(g, mat), function (glb) {
+                downloadBlob(new Blob([glb], { type: 'application/octet-stream' }), 'terrain.glb');
+            }, function (err) { console.error(err); }, { binary: true });
+        }
+
+        // --- GRASS (instanced cross-quad billboards) ---
+        const MAX_GRASS_GROUPS = 4;
+        const grassRoot = new THREE.Group();
+        scene.add(grassRoot);
+        const grassGroups = [];
+        const grassSlots = [false, false, false, false];
+        const terrainStats = { hMin: 0, range: 1 };
+        let grassDirty = false;
+        const scheduleGrassRebuild = () => { grassDirty = true; };
+
+        // Each preset gives a different default look + sensible placement limits.
+        // Altitude is normalized 0..1 across the terrain (same scale as the Snow Line slider).
+        const GRASS_PRESETS = [
+            { minAlt: 0.00, maxAlt: 0.50, maxSlope: 0.20, minHeight: 0.8, maxHeight: 1.6, density: 30, count: 3000, seed: 1 },
+            { minAlt: 0.05, maxAlt: 0.55, maxSlope: 0.25, minHeight: 1.4, maxHeight: 2.4, density: 8,  count: 1000, seed: 2 },
+            { minAlt: 0.00, maxAlt: 0.40, maxSlope: 0.20, minHeight: 0.7, maxHeight: 1.2, density: 4,  count: 400,  seed: 3 },
+            { minAlt: 0.30, maxAlt: 0.70, maxSlope: 0.30, minHeight: 0.6, maxHeight: 1.1, density: 6,  count: 600,  seed: 4 }
+        ];
+
+        function makeRng(seed) {
+            let a = seed >>> 0;
+            return () => {
+                a = (a + 0x6D2B79F5) >>> 0;
+                let t = a;
+                t = Math.imul(t ^ (t >>> 15), t | 1);
+                t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+                return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+            };
+        }
+
+        // Two crossed quads, each doubled with reversed winding so both sides are lit
+        // identically (normals point up, which gives soft grass-like shading).
+        const grassGeometry = (() => {
+            const pos = [
+                -0.5, 0, 0,   0.5, 0, 0,   0.5, 1, 0,   -0.5, 1, 0,
+                 0, 0, -0.5,  0, 0, 0.5,   0, 1, 0.5,    0, 1, -0.5
+            ];
+            const uv = [0, 0, 1, 0, 1, 1, 0, 1, 0, 0, 1, 0, 1, 1, 0, 1];
+            const idx = [
+                0, 1, 2, 0, 2, 3,   0, 2, 1, 0, 3, 2,
+                4, 5, 6, 4, 6, 7,   4, 6, 5, 4, 7, 6
+            ];
+            const nrm = [];
+            for (let i = 0; i < 8; i++) nrm.push(0, 1, 0);
+            const g = new THREE.BufferGeometry();
+            g.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
+            g.setAttribute('normal', new THREE.Float32BufferAttribute(nrm, 3));
+            g.setAttribute('uv', new THREE.Float32BufferAttribute(uv, 2));
+            g.setIndex(idx);
+            return g;
+        })();
+
+        // Default grass textures (transparent PNG-style canvases), one look per slot
+        function drawBlade(ctx, bx, by, tx, ty, cx, cy, w, c0, c1) {
+            ctx.beginPath();
+            ctx.moveTo(bx - w / 2, by);
+            ctx.quadraticCurveTo(cx - w / 4, cy, tx, ty);
+            ctx.quadraticCurveTo(cx + w / 4, cy, bx + w / 2, by);
+            ctx.closePath();
+            const grad = ctx.createLinearGradient(0, by, 0, ty);
+            grad.addColorStop(0, c0);
+            grad.addColorStop(1, c1);
+            ctx.fillStyle = grad;
+            ctx.fill();
+        }
+
+        function makeGrassTexture(style) {
+            const S = 256;
+            const canvas = document.createElement('canvas');
+            canvas.width = canvas.height = S;
+            const ctx = canvas.getContext('2d');
+            const rng = makeRng(1000 + style);
+            const cfg = [
+                { n: 30, c0: '#244d1a', c1: '#7cb83f', lMin: 0.50, lMax: 0.95, wMin: 6, wMax: 11, spread: 0.45, flowers: 0 },
+                { n: 22, c0: '#3b6b24', c1: '#b5cc62', lMin: 0.75, lMax: 1.00, wMin: 4, wMax: 7,  spread: 0.35, flowers: 0 },
+                { n: 16, c0: '#2c5a1f', c1: '#6fae3a', lMin: 0.45, lMax: 0.80, wMin: 4, wMax: 7,  spread: 0.40, flowers: 6 },
+                { n: 26, c0: '#7a6a2e', c1: '#d9c67c', lMin: 0.35, lMax: 0.75, wMin: 6, wMax: 10, spread: 0.50, flowers: 0 }
+            ][style % 4];
+
+            const blade = (len, w, lean, c0, c1, baseX) => {
+                const tx = Math.min(S - 6, Math.max(6, baseX + lean));
+                const ty = S - len;
+                drawBlade(ctx, baseX, S, tx, ty, baseX + lean * 0.25 + (rng() - 0.5) * 10, S - len * 0.55, w, c0, c1);
+                return [tx, ty];
+            };
+
+            for (let i = 0; i < cfg.n; i++) {
+                const baseX = S * (0.5 + (rng() - 0.5) * 0.4);
+                const len = S * (cfg.lMin + rng() * (cfg.lMax - cfg.lMin));
+                const w = cfg.wMin + rng() * (cfg.wMax - cfg.wMin);
+                blade(len, w, (rng() - 0.5) * cfg.spread * S, cfg.c0, cfg.c1, baseX);
+            }
+
+            const petals = ['#f4a6c0', '#ffd84a', '#ffffff', '#c28bf0'];
+            for (let f = 0; f < cfg.flowers; f++) {
+                const baseX = S * (0.3 + rng() * 0.4);
+                const len = S * (0.55 + rng() * 0.3);
+                const [fx, fy] = blade(len, 3, (rng() - 0.5) * 0.3 * S, '#2c5a1f', '#4f8a2b', baseX);
+                const col = petals[Math.floor(rng() * petals.length)];
+                ctx.fillStyle = col;
+                for (let p = 0; p < 5; p++) {
+                    const ang = (p / 5) * Math.PI * 2;
+                    ctx.beginPath();
+                    ctx.arc(fx + Math.cos(ang) * 8, fy + Math.sin(ang) * 8, 7, 0, Math.PI * 2);
+                    ctx.fill();
+                }
+                ctx.fillStyle = '#e8a317';
+                ctx.beginPath();
+                ctx.arc(fx, fy, 5, 0, Math.PI * 2);
+                ctx.fill();
+            }
+            return new THREE.CanvasTexture(canvas);
+        }
+
+        function setGrassTexture(g, tex, aspect, fileName) {
+            tex.colorSpace = THREE.SRGBColorSpace;
+            tex.anisotropy = renderer.capabilities.getMaxAnisotropy();
+            tex.needsUpdate = true;
+            const old = g.material.map;
+            g.material.map = tex;
+            g.material.needsUpdate = true;
+            if (old) old.dispose();
+            g.aspect = aspect;
+            g.fileName = fileName;
+            scheduleGrassRebuild();
+        }
+
+        function createGrassGroup() {
+            const slot = grassSlots.indexOf(false);
+            if (slot < 0) return null;
+            grassSlots[slot] = true;
+            const g = {
+                ...GRASS_PRESETS[slot],
+                slot, aspect: 1, fileName: null, placed: 0, mesh: null, folder: null,
+                material: new THREE.MeshStandardMaterial({ alphaTest: 0.4, roughness: 1, metalness: 0 })
+            };
+            setGrassTexture(g, makeGrassTexture(slot), 1, null);
+            grassGroups.push(g);
+            return g;
+        }
+
+        function removeGrassGroup(g) {
+            if (g.mesh) { grassRoot.remove(g.mesh); g.mesh.dispose(); }
+            if (g.material.map) g.material.map.dispose();
+            g.material.dispose();
+            grassSlots[g.slot] = false;
+            grassGroups.splice(grassGroups.indexOf(g), 1);
+            scheduleGrassRebuild();
+        }
+
+        // Sample the actual mesh surface (bilinear) so grass sits exactly on the terrain
+        const _surf = { y: 0, t: 0, slope: 0 };
+        function surfaceAt(x, z, out) {
+            const W = SEG_X + 1;
+            const fx = (x + SIZE_X / 2) / (SIZE_X / SEG_X), fz = (z + SIZE_Z / 2) / (SIZE_Z / SEG_Z);
+            const ix = Math.min(SEG_X - 1, Math.max(0, Math.floor(fx)));
+            const iz = Math.min(SEG_Z - 1, Math.max(0, Math.floor(fz)));
+            const tx = Math.min(1, Math.max(0, fx - ix)), tz = Math.min(1, Math.max(0, fz - iz));
+            const i00 = iz * W + ix, i10 = i00 + 1, i01 = i00 + W, i11 = i01 + 1;
+            const bil = (a, b, c, d) => (a * (1 - tx) + b * tx) * (1 - tz) + (c * (1 - tx) + d * tx) * tz;
+            const h = bil(heights[i00], heights[i10], heights[i01], heights[i11]);
+            const ny = geometry.attributes.normal.array;
+            out.y = h * params.height;
+            out.t = (h - terrainStats.hMin) / terrainStats.range;
+            out.slope = 1 - bil(ny[i00 * 3 + 1], ny[i10 * 3 + 1], ny[i01 * 3 + 1], ny[i11 * 3 + 1]);
+            return out;
+        }
+
+        const _m4 = new THREE.Matrix4(), _q = new THREE.Quaternion(), _p = new THREE.Vector3();
+        const _sc = new THREE.Vector3(), _up = new THREE.Vector3(0, 1, 0), _col = new THREE.Color();
+
+        function rebuildGrass() {
+            grassDirty = false;
+            const halfX = SIZE_X / 2, halfZ = SIZE_Z / 2;
+            const maxR = Math.max(0.25, ...grassGroups.map(g => g.maxHeight * g.aspect * 0.5));
+            const cell = maxR * 2;
+            const hash = new Map();   // shared by all groups, so different grass types never overlap either
+            const key = (cx, cz) => cx + cz * 8192;
+            const overlaps = (x, z, r) => {
+                const cx = Math.floor((x + halfX) / cell), cz = Math.floor((z + halfZ) / cell);
+                for (let dx = -1; dx <= 1; dx++) {
+                    for (let dz = -1; dz <= 1; dz++) {
+                        const arr = hash.get(key(cx + dx, cz + dz));
+                        if (!arr) continue;
+                        for (const o of arr) {
+                            const ex = o.x - x, ez = o.z - z, rr = o.r + r;
+                            if (ex * ex + ez * ez < rr * rr) return true;
+                        }
+                    }
+                }
+                return false;
+            };
+
+            for (const g of grassGroups) {
+                if (g.mesh) { grassRoot.remove(g.mesh); g.mesh.dispose(); g.mesh = null; }
+                g.placed = 0;
+                const rng = makeRng(g.seed);
+                const ok = () => _surf.t >= g.minAlt && _surf.t <= g.maxAlt && _surf.slope <= g.maxSlope;
+
+                // Estimate eligible area, then target = density x area (capped by the total)
+                const G = 60;
+                let good = 0;
+                for (let i = 0; i < G; i++) {
+                    for (let j = 0; j < G; j++) {
+                        surfaceAt(((i + 0.5) / G - 0.5) * SIZE_X, ((j + 0.5) / G - 0.5) * SIZE_Z, _surf);
+                        if (ok()) good++;
+                    }
+                }
+                const area = (good / (G * G)) * SIZE_X * SIZE_Z;
+                const target = Math.min(g.count, Math.round(g.density * area / 100));
+
+                const items = [];
+                let attempts = 0;
+                const maxAttempts = target * 40 + 200;
+                while (items.length < target && attempts++ < maxAttempts) {
+                    const x = (rng() - 0.5) * SIZE_X, z = (rng() - 0.5) * SIZE_Z;
+                    const h = g.minHeight + rng() * (g.maxHeight - g.minHeight);
+                    const w = h * g.aspect, r = w * 0.5;
+                    const rot = rng() * Math.PI, shade = 0.75 + rng() * 0.35;
+                    surfaceAt(x, z, _surf);
+                    if (!ok() || overlaps(x, z, r)) continue;
+                    const k = key(Math.floor((x + halfX) / cell), Math.floor((z + halfZ) / cell));
+                    if (!hash.has(k)) hash.set(k, []);
+                    hash.get(k).push({ x, z, r });
+                    items.push({ x, y: _surf.y - h * 0.05, z, rot, h, w, shade });
+                }
+                g.placed = items.length;
+                if (!items.length) continue;
+
+                const mesh = new THREE.InstancedMesh(grassGeometry, g.material, items.length);
+                items.forEach((it, i) => {
+                    _p.set(it.x, it.y, it.z);
+                    _q.setFromAxisAngle(_up, it.rot);
+                    _sc.set(it.w, it.h, it.w);
+                    _m4.compose(_p, _q, _sc);
+                    mesh.setMatrixAt(i, _m4);
+                    _col.setScalar(it.shade);
+                    mesh.setColorAt(i, _col);
+                });
+                mesh.instanceMatrix.needsUpdate = true;
+                if (mesh.instanceColor) mesh.instanceColor.needsUpdate = true;
+                mesh.frustumCulled = false;
+                grassRoot.add(mesh);
+                g.mesh = mesh;
+            }
+        }
+
+        // --- TERRAIN GENERATION ---
+        let noise2D = createNoise2D(params.seed);
+
+        // Ridged fractal noise: sharp peaks and valleys, like real mountains.
+        // Returns a value in roughly 0..1.
+        function mountainHeight(x, z) {
+            // Slowly-varying noise fields (independent of each other via offsets)
+            const mFreq = 1.5 / NOISE_REF;
+            const widthMask = noise2D(x * mFreq + 100, z * mFreq + 100);   // -1..1
+
+            // Domain warp: bends/stretches the ridges so shapes aren't uniform
+            const wFreq = 2.0 / NOISE_REF;
+            const wAmt = params.warp * NOISE_REF * 0.15;
+            const wx = x + noise2D(x * wFreq + 300, z * wFreq) * wAmt;
+            const wz = z + noise2D(x * wFreq, z * wFreq + 700) * wAmt;
+
+            // Local frequency multiplier: <1 = broad mountains, >1 = narrow ones
+            const localMul = Math.pow(2, widthMask * params.widthVariation * 1.5);
+
+            // Peak roundness softens the sharp crease that |noise| creates at ridge tops
+            const k = 0.0005 + params.peakRoundness * params.peakRoundness * 0.25;
+            const sqrtK = Math.sqrt(k);
+            const sharp = params.ridgeSharpness;
+
+            let amp = 1, freq = (params.frequency / NOISE_REF) * localMul;
+            let sum = 0, norm = 0;
+            for (let o = 0; o < params.octaves; o++) {
+                const v = noise2D(wx * freq, wz * freq);
+                const smooth = v * 0.5 + 0.5;                              // rolling hills
+                const ridge = 1 - (Math.sqrt(v * v + k) - sqrtK);          // rounded ridges
+                let n = smooth + (ridge - smooth) * sharp;                 // blend the two
+                n = Math.pow(Math.max(n, 0), 1 + sharp);                   // broader valleys
+                sum += n * amp;
+                norm += amp;
+                amp *= params.persistence;
+                freq *= 2;
+            }
+            return sum / norm;
+        }
+
+        let heights = new Float32Array(geometry.attributes.position.count);
+
+        function generateTerrain() {
+            const pos = geometry.attributes.position;
+            const col = geometry.attributes.color;
+            const nrm = geometry.attributes.normal;
+            const splat = geometry.attributes.aSplat;
+
+            // Pass 1: heights
+            let hMin = Infinity, hMax = -Infinity;
+            for (let i = 0; i < pos.count; i++) {
+                const h = mountainHeight(pos.getX(i), pos.getZ(i));
+                heights[i] = h;
+                if (h < hMin) hMin = h;
+                if (h > hMax) hMax = h;
+                pos.setY(i, h * params.height);
+            }
+            pos.needsUpdate = true;
+            terrainStats.hMin = hMin;
+            terrainStats.range = Math.max(hMax - hMin, 1e-6);
+
+            // Normals are needed to measure slope
+            geometry.computeVertexNormals();
+
+            // Pass 2: colors from normalized height (0..1 across this terrain) and slope
+            const range = Math.max(hMax - hMin, 1e-6);
+            for (let i = 0; i < pos.count; i++) {
+                const t = (heights[i] - hMin) / range;
+                const slope = 1 - nrm.getY(i);  // 0 = flat, larger = steeper
+
+                // Variation so large areas don't look like a flat fill
+                const variation = noise2D(pos.getX(i) * 0.25 + 50, pos.getZ(i) * 0.25 + 50) * 0.06;
+
+                // Grass: lowland -> highland with altitude
+                tmpColor.copy(COL.lowland).lerp(COL.highland, smoothstep(0.0, 0.6, t));
+
+                // Rock on steep faces (brown low down, grey up high)
+                rockColor.copy(COL.rockLow).lerp(COL.rockHigh, smoothstep(0.2, 0.8, t));
+                const rockAmt = smoothstep(params.rockSlope - params.rockBlend,
+                                           params.rockSlope + params.rockBlend, slope);
+                tmpColor.lerp(rockColor, rockAmt);
+
+                // Snow above the snow line; it clings less to very steep faces
+                let snowAmt = smoothstep(params.snowLine - 0.08, params.snowLine + 0.06, t);
+                snowAmt *= 1 - 0.75 * smoothstep(params.rockSlope, params.rockSlope + 0.25, slope);
+                tmpColor.lerp(COL.snow, snowAmt);
+
+                const shade = 1 + variation * (1 - snowAmt);
+                col.setXYZ(i, tmpColor.r * shade, tmpColor.g * shade, tmpColor.b * shade);
+
+                // Texture blend weights (sum to 1) + brightness variation
+                const wSnow = snowAmt;
+                const wRock = (1 - snowAmt) * rockAmt;
+                const wGrass = (1 - snowAmt) * (1 - rockAmt);
+                const highland = smoothstep(0.0, 0.6, t);
+                const texShade = (1 + variation * 1.5 * (1 - snowAmt)) * (1 - 0.2 * highland * wGrass);
+                splat.setXYZW(i, wGrass, wRock, wSnow, texShade);
+            }
+            col.needsUpdate = true;
+            splat.needsUpdate = true;
+
+            geometry.computeBoundingSphere();
+            geometry.computeBoundingBox();
+            scheduleGrassRebuild();
+        }
+
+        // Minimal 16-bit grayscale PNG encoder (uncompressed deflate blocks, no dependencies)
+        const CRC_TABLE = (() => {
+            const t = new Uint32Array(256);
+            for (let n = 0; n < 256; n++) {
+                let c = n;
+                for (let k = 0; k < 8; k++) c = (c & 1) ? (0xEDB88320 ^ (c >>> 1)) : (c >>> 1);
+                t[n] = c >>> 0;
+            }
+            return t;
+        })();
+        function crc32(bytes) {
+            let c = 0xFFFFFFFF;
+            for (let i = 0; i < bytes.length; i++) c = CRC_TABLE[(c ^ bytes[i]) & 255] ^ (c >>> 8);
+            return (c ^ 0xFFFFFFFF) >>> 0;
+        }
+        function encodePNG16(width, height, data16) {
+            const rowLen = width * 2 + 1;
+            const raw = new Uint8Array(rowLen * height);
+            let o = 0;
+            for (let y = 0; y < height; y++) {
+                raw[o++] = 0; // filter: none
+                for (let x = 0; x < width; x++) {
+                    const v = data16[y * width + x];
+                    raw[o++] = v >> 8;
+                    raw[o++] = v & 255;
+                }
+            }
+            // zlib stream made of stored (uncompressed) blocks
+            const nBlocks = Math.max(1, Math.ceil(raw.length / 65535));
+            const z = new Uint8Array(2 + raw.length + nBlocks * 5 + 4);
+            let p = 0;
+            z[p++] = 0x78; z[p++] = 0x01;
+            for (let b = 0; b < nBlocks; b++) {
+                const start = b * 65535;
+                const len = Math.min(65535, raw.length - start);
+                z[p++] = (b === nBlocks - 1) ? 1 : 0;
+                z[p++] = len & 255; z[p++] = len >> 8;
+                z[p++] = (~len) & 255; z[p++] = ((~len) >> 8) & 255;
+                z.set(raw.subarray(start, start + len), p);
+                p += len;
+            }
+            let s1 = 1, s2 = 0;
+            for (let i = 0; i < raw.length; i++) { s1 = (s1 + raw[i]) % 65521; s2 = (s2 + s1) % 65521; }
+            const adler = ((s2 << 16) | s1) >>> 0;
+            z[p++] = adler >>> 24; z[p++] = (adler >>> 16) & 255; z[p++] = (adler >>> 8) & 255; z[p++] = adler & 255;
+
+            const chunk = (type, data) => {
+                const out = new Uint8Array(12 + data.length);
+                const dv = new DataView(out.buffer);
+                dv.setUint32(0, data.length);
+                for (let i = 0; i < 4; i++) out[4 + i] = type.charCodeAt(i);
+                out.set(data, 8);
+                dv.setUint32(8 + data.length, crc32(out.subarray(4, 8 + data.length)));
+                return out;
+            };
+            const ihdr = new Uint8Array(13);
+            const hv = new DataView(ihdr.buffer);
+            hv.setUint32(0, width); hv.setUint32(4, height);
+            ihdr[8] = 16; ihdr[9] = 0; // 16-bit grayscale
+            const parts = [
+                new Uint8Array([137, 80, 78, 71, 13, 10, 26, 10]),
+                chunk('IHDR', ihdr), chunk('IDAT', z.subarray(0, p)), chunk('IEND', new Uint8Array(0))
+            ];
+            const total = parts.reduce((n, a) => n + a.length, 0);
+            const png = new Uint8Array(total);
+            let q = 0;
+            for (const a of parts) { png.set(a, q); q += a.length; }
+            return png;
+        }
+
+        function downloadHeightMap() {
+            const maxRes = Math.min(2048, Math.max(64, Math.round(params.heightMapSize) || 1024));
+            const aspect = SIZE_X / SIZE_Z;
+            const w = aspect >= 1 ? maxRes : Math.max(2, Math.round(maxRes * aspect));
+            const h = aspect >= 1 ? Math.max(2, Math.round(maxRes / aspect)) : maxRes;
+            const vals = new Float32Array(w * h);
+            let lo = Infinity, hi = -Infinity;
+            for (let j = 0; j < h; j++) {
+                const z = (j / (h - 1) - 0.5) * SIZE_Z;      // top row = -Z edge, matching the texture bake
+                for (let i = 0; i < w; i++) {
+                    const v = mountainHeight((i / (w - 1) - 0.5) * SIZE_X, z);
+                    vals[j * w + i] = v;
+                    if (v < lo) lo = v;
+                    if (v > hi) hi = v;
+                }
+            }
+            const range = Math.max(hi - lo, 1e-9);
+            const data16 = new Uint16Array(w * h);
+            for (let i = 0; i < data16.length; i++) data16[i] = Math.round(((vals[i] - lo) / range) * 65535);
+            downloadBlob(new Blob([encodePNG16(w, h, data16)], { type: 'image/png' }), 'heightmap.png');
+        }
+
+        // Rebuild the mesh when the map dimensions change
+        let sizeControllers = [];
+        function applyMapSize() {
+            SIZE_X = Math.min(1000, Math.max(10, Number(params.mapSizeX) || 100));
+            SIZE_Z = Math.min(1000, Math.max(10, Number(params.mapSizeZ) || 100));
+            params.mapSizeX = SIZE_X;
+            params.mapSizeZ = SIZE_Z;
+            sizeControllers.forEach(c => c.updateDisplay());
+
+            const old = geometry;
+            geometry = createTerrainGeometry();
+            terrain.geometry = geometry;
+            old.dispose();
+            heights = new Float32Array(geometry.attributes.position.count);
+
+            // Keep fog, camera range and framing sensible for the new size
+            const m = Math.max(SIZE_X, SIZE_Z);
+            scene.fog.near = m * 1.5;
+            scene.fog.far = m * 4;
+            camera.far = m * 10;
+            camera.updateProjectionMatrix();
+            camera.position.set(0, m * 0.6, m);
+            controls.target.set(0, 0, 0);
+            controls.update();
+
+            generateTerrain();
+        }
+
+        generateTerrain();
+
+        // --- LIL-GUI ---
+        const gui = new GUI({ title: 'Controls' });
+
+        // Topography
+        const topoFolder = gui.addFolder('Topography');
+        sizeControllers = [
+            topoFolder.add(params, 'mapSizeX').name('Map Size X').onFinishChange(applyMapSize),
+            topoFolder.add(params, 'mapSizeZ').name('Map Size Y').onFinishChange(applyMapSize)
+        ];
+        topoFolder.add(params, 'frequency', 0.5, 10, 0.1).name('Noise Frequency').onChange(generateTerrain);
+        topoFolder.add(params, 'height', 0, 50).name('Terrain Height').onChange(generateTerrain);
+        topoFolder.add(params, 'octaves', 1, 8, 1).name('Detail (Octaves)').onChange(generateTerrain);
+        topoFolder.add(params, 'persistence', 0.2, 0.8, 0.01).name('Roughness').onChange(generateTerrain);
+        topoFolder.add(params, 'ridgeSharpness', 0, 1, 0.01).name('Ridge Sharpness').onChange(generateTerrain);
+        topoFolder.add(params, 'peakRoundness', 0, 1, 0.01).name('Peak Roundness').onChange(generateTerrain);
+        topoFolder.add(params, 'widthVariation', 0, 1, 0.01).name('Base Width Variation').onChange(generateTerrain);
+        topoFolder.add(params, 'warp', 0, 1, 0.01).name('Shape Warp').onChange(generateTerrain);
+        topoFolder.add(params, 'seed', 1, 9999, 1).name('Seed').onChange(v => {
+            noise2D = createNoise2D(v);
+            generateTerrain();
+        });
+        topoFolder.add(params, 'heightMapSize').name('Height Map Resolution (px)');
+
+        // Colours
+        const colorFolder = gui.addFolder('Colours');
+        colorFolder.add(params, 'snowLine', 0.3, 1, 0.01).name('Snow Line').onChange(generateTerrain);
+        colorFolder.add(params, 'rockSlope', 0.05, 0.8, 0.01).name('Rock Steepness').onChange(generateTerrain);
+        colorFolder.add(params, 'rockBlend', 0.02, 0.4, 0.01).name('Rock Blend').onChange(generateTerrain);
+
+        // Textures
+        const texFolder = gui.addFolder('Textures');
+        texFolder.add(params, 'useTextures').name('Use Textures').onChange(v => texUniforms.uUseTex.value = v ? 1 : 0);
+        texFolder.add(params, 'tileSize', 4, 40, 0.5).name('Tile Size').onChange(v => texUniforms.uTile.value = v);
+        Object.keys(layers).forEach(key => {
+            const handlers = { upload: () => uploadLayer(key), reset: () => resetLayer(key) };
+            layerControllers[key] = texFolder.add(handlers, 'upload').name(`${layers[key].label}: upload image...`);
+            texFolder.add(handlers, 'reset').name(`${layers[key].label}: reset to default`);
+        });
+        // --- GRASS GUI ---
+        const grassFolder = gui.addFolder('Grass');
+        grassFolder.add({ show: true }, 'show').name('Show Grass').onChange(v => grassRoot.visible = v);
+        let addGrassCtrl;
+
+        function renumberGrassFolders() {
+            grassGroups.forEach((g, i) => g.folder.title(`Grass type ${i + 1}`));
+            addGrassCtrl.disable(grassGroups.length >= MAX_GRASS_GROUPS);
+        }
+
+        function addGrassGroupGUI() {
+            const g = createGrassGroup();
+            if (!g) return;
+            const f = g.folder = grassFolder.addFolder('Grass type');
+            const rebuild = () => scheduleGrassRebuild();
+
+            const cMinAlt = f.add(g, 'minAlt', 0, 1, 0.01).name('Min Altitude').onChange(v => {
+                if (v > g.maxAlt) { g.maxAlt = v; cMaxAlt.updateDisplay(); }
+                rebuild();
+            });
+            const cMaxAlt = f.add(g, 'maxAlt', 0, 1, 0.01).name('Max Altitude').onChange(v => {
+                if (v < g.minAlt) { g.minAlt = v; cMinAlt.updateDisplay(); }
+                rebuild();
+            });
+            f.add(g, 'maxSlope', 0.02, 1, 0.01).name('Max Slope').onChange(rebuild);
+            const cMinH = f.add(g, 'minHeight', 0.1, 6, 0.05).name('Min Blade Height').onChange(v => {
+                if (v > g.maxHeight) { g.maxHeight = v; cMaxH.updateDisplay(); }
+                rebuild();
+            });
+            const cMaxH = f.add(g, 'maxHeight', 0.1, 6, 0.05).name('Max Blade Height').onChange(v => {
+                if (v < g.minHeight) { g.minHeight = v; cMinH.updateDisplay(); }
+                rebuild();
+            });
+            f.add(g, 'density', 0, 100, 0.5).name('Density (per 100 u²)').onChange(rebuild);
+            f.add(g, 'count', 0, 5000, 1).name('Max Total').onChange(rebuild);
+            f.add(g, 'seed', 1, 9999, 1).name('Seed').onChange(rebuild);
+            f.add(g, 'placed').name('Placed').listen().disable();
+
+            const actions = {
+                upload: () => pickFile(file => {
+                    const url = URL.createObjectURL(file);
+                    new THREE.TextureLoader().load(url, tex => {
+                        const img = tex.image;
+                        setGrassTexture(g, tex, img.width / img.height, file.name);
+                        uploadCtrl.name(`Texture: ${file.name}`);
+                        URL.revokeObjectURL(url);
+                    }, undefined, () => alert('Could not load that image.'));
+                }),
+                reset: () => {
+                    setGrassTexture(g, makeGrassTexture(g.slot), 1, null);
+                    uploadCtrl.name('Texture: upload image...');
+                },
+                remove: () => {
+                    f.destroy();
+                    removeGrassGroup(g);
+                    renumberGrassFolders();
+                }
+            };
+            const uploadCtrl = f.add(actions, 'upload').name('Texture: upload image...');
+            f.add(actions, 'reset').name('Texture: reset to default');
+            f.add(actions, 'remove').name('Remove this grass type');
+            renumberGrassFolders();
+        }
+
+        addGrassCtrl = grassFolder.add({ add: addGrassGroupGUI }, 'add').name('+ Add grass type (max 4)');
+        addGrassGroupGUI(); // start with one type
+
+        [topoFolder, colorFolder, texFolder, grassFolder].forEach(f => f.close());
+        gui.close();
+
+        gui.add(params, 'wireframe').onChange(v => material.wireframe = v);
+        gui.add(params, 'exportGLB').name('Download .glb');
+        gui.add(params, 'downloadHeightMap').name('Download height map');
+
+        function downloadBlob(blob, filename) {
+            const link = document.createElement('a');
+            link.href = URL.createObjectURL(blob);
+            link.download = filename;
+            link.click();
+        }
+
+        // --- RENDER LOOP ---
+        function animate() {
+            requestAnimationFrame(animate);
+            controls.update();
+            if (grassDirty) rebuildGrass();
+            renderer.render(scene, camera);
+        }
+        animate();
+
+        window.addEventListener('resize', () => {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        });
+    </script>
+</body>
+</html>
